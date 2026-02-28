@@ -1,0 +1,16 @@
+[package]
+name = "void"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mailin-embedded = "0.8"
+mailparse = "0.16"
+html2text = "0.16"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+rand = "0.9"
+dirs = "6"
+email_address = "0.2"
+gethostname = "1"
