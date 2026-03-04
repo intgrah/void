@@ -8,9 +8,9 @@ mailin-embedded = "0.8"
 mailparse = "0.16"
 html2text = "0.16"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1"
 clap = { version = "4", features = ["derive", "env"] }
-rand = "0.9"
+rand = "0.10"
 dirs = "6"
 email_address = "0.2"
 gethostname = "1"

@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use email_address::EmailAddress;
 use mailin_embedded::{Handler, Response, Server, response};
 use mailparse::{MailHeaderMap, parse_mail};
-use rand::Rng as _;
+use rand::RngExt as _;
 use serde::Deserialize;
 use std::fs;
 use std::io::{self, Write};
@@ -100,7 +100,7 @@ fn generate_inbox_name() -> String {
 fn parse_inbox_arg(input: &str, config: &Config) -> String {
     let input = input.trim().to_lowercase();
     let email = if input.contains('@') {
-        input.clone()
+        input
     } else {
         format!("{}@{}", input, config.domain)
     };
@@ -137,18 +137,14 @@ fn copy_to_clipboard(text: &str) -> bool {
 
 fn list_inboxes(config: &Config) {
     let cmd = format!("ls -1 '{}'", config.mail_path);
-    match run_command(config, &cmd) {
-        Some(output) => {
-            let inboxes: Vec<&str> = output.lines().collect();
-            if inboxes.is_empty() {
-                println!("No inboxes yet.");
-            } else {
-                for inbox in inboxes {
-                    println!("{}@{}", inbox, config.domain);
-                }
-            }
+    let output = run_command(config, &cmd).unwrap_or_default();
+    let inboxes: Vec<&str> = output.lines().collect();
+    if inboxes.is_empty() {
+        println!("No inboxes yet.");
+    } else {
+        for inbox in inboxes {
+            println!("{}@{}", inbox, config.domain);
         }
-        None => println!("No inboxes yet."),
     }
 }
 
@@ -262,8 +258,6 @@ fn watch_inbox(config: &Config, inbox: &str, show_copied: bool) {
     }
 }
 
-// SMTP Server
-
 #[derive(Clone)]
 struct SmtpHandler {
     mail_path: PathBuf,
@@ -373,8 +367,6 @@ fn run_server(domain: &str, mail_path: &str, bind: &str, port: u16) {
     let handler = SmtpHandler::new(PathBuf::from(mail_path), domain.to_string());
 
     let addr = format!("{}:{}", bind, port);
-    println!("Starting SMTP server on {} for domain {}", addr, domain);
-    println!("Mail path: {}", mail_path);
 
     let mut server = Server::new(handler);
     server
