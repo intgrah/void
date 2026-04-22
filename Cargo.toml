@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 mailin-embedded = "0.8"
 mailparse = "0.16"
-html2text = "0.16"
+html2text = "0.17"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 clap = { version = "4", features = ["derive", "env"] }
