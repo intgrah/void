@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 struct Config {
     #[serde(default)]
     host: String,
-    domain: String,
+    domains: Vec<String>,
     mail_path: String,
 }
 
@@ -27,7 +27,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    #[arg(help = "Inbox name to watch")]
+    #[arg(help = "Inbox to watch as [local]@<domain>")]
     inbox: Option<String>,
 }
 
@@ -39,8 +39,8 @@ enum Commands {
         bind: String,
         #[arg(long, default_value = "25")]
         port: u16,
-        #[arg(long, env = "DOMAIN")]
-        domain: Option<String>,
+        #[arg(long, env = "DOMAINS", value_delimiter = ',')]
+        domains: Vec<String>,
         #[arg(long, env = "MAIL_PATH", default_value = "/data")]
         mail_path: String,
     },
@@ -56,15 +56,22 @@ fn load_config() -> Config {
         eprintln!("Config not found at {:?}", config_path);
         eprintln!("Create it with:");
         eprintln!("  host = \"your-ssh-host\"  # empty for local");
-        eprintln!("  domain = \"void.example.com\"");
-        eprintln!("  mail_path = \"/var/mail/vhosts/void.example.com\"");
+        eprintln!("  domains = [\"void.example.com\"]");
+        eprintln!("  mail_path = \"/var/mail/vhosts\"");
         std::process::exit(1);
     });
 
-    toml::from_str(&content).unwrap_or_else(|e| {
+    let cfg: Config = toml::from_str(&content).unwrap_or_else(|e| {
         eprintln!("Invalid config: {}", e);
         std::process::exit(1);
-    })
+    });
+
+    if cfg.domains.is_empty() {
+        eprintln!("Config must specify at least one domain");
+        std::process::exit(1);
+    }
+
+    cfg
 }
 
 fn is_local(config: &Config) -> bool {
@@ -97,31 +104,35 @@ fn generate_inbox_name() -> String {
         .collect()
 }
 
-fn parse_inbox_arg(input: &str, config: &Config) -> String {
+fn parse_inbox_arg(input: &str, config: &Config) -> (Option<String>, String) {
     let input = input.trim().to_lowercase();
-    let email = if input.contains('@') {
-        input
-    } else {
-        format!("{}@{}", input, config.domain)
-    };
-
-    match email.parse::<EmailAddress>() {
-        Ok(addr) => {
-            if addr.domain() != config.domain {
-                eprintln!(
-                    "Error: Wrong domain '{}', expected '{}'",
-                    addr.domain(),
-                    config.domain
-                );
-                std::process::exit(1);
-            }
-            addr.local_part().to_string()
-        }
-        Err(_) => {
-            eprintln!("Error: Invalid email '{}'", email);
+    let (local, domain) = match input.split_once('@') {
+        Some((l, d)) => (l, d),
+        None => {
+            eprintln!("Error: Inbox must be '[local]@<domain>', got '{}'", input);
             std::process::exit(1);
         }
+    };
+
+    if !config.domains.iter().any(|d| d == domain) {
+        eprintln!(
+            "Error: Domain '{}' not in configured domains: {}",
+            domain,
+            config.domains.join(", ")
+        );
+        std::process::exit(1);
     }
+
+    if local.is_empty() {
+        return (None, domain.to_string());
+    }
+
+    let email = format!("{}@{}", local, domain);
+    if email.parse::<EmailAddress>().is_err() {
+        eprintln!("Error: Invalid email '{}'", email);
+        std::process::exit(1);
+    }
+    (Some(local.to_string()), domain.to_string())
 }
 
 fn copy_to_clipboard(text: &str) -> bool {
@@ -136,15 +147,19 @@ fn copy_to_clipboard(text: &str) -> bool {
 }
 
 fn list_inboxes(config: &Config) {
-    let cmd = format!("ls -1 '{}'", config.mail_path);
-    let output = run_command(config, &cmd).unwrap_or_default();
-    let inboxes: Vec<&str> = output.lines().collect();
-    if inboxes.is_empty() {
-        println!("No inboxes yet.");
-    } else {
-        for inbox in inboxes {
-            println!("{}@{}", inbox, config.domain);
+    let mut any = false;
+    for domain in &config.domains {
+        let cmd = format!("ls -1 '{}/{}' 2>/dev/null", config.mail_path, domain);
+        let output = run_command(config, &cmd).unwrap_or_default();
+        for inbox in output.lines() {
+            if !inbox.is_empty() {
+                println!("{}@{}", inbox, domain);
+                any = true;
+            }
         }
+    }
+    if !any {
+        println!("No inboxes yet.");
     }
 }
 
@@ -206,9 +221,9 @@ fn extract_body_from_parts(parts: &[mailparse::ParsedMail]) -> String {
     }
 }
 
-fn watch_inbox(config: &Config, inbox: &str, show_copied: bool) {
-    let maildir_path = format!("{}/{}/new", config.mail_path, inbox);
-    let email_addr = format!("{}@{}", inbox, config.domain);
+fn watch_inbox(config: &Config, domain: &str, inbox: &str, show_copied: bool) {
+    let maildir_path = format!("{}/{}/{}/new", config.mail_path, domain, inbox);
+    let email_addr = format!("{}@{}", inbox, domain);
 
     let mut last_files: Vec<String> = Vec::new();
     let mut first_run = true;
@@ -261,16 +276,16 @@ fn watch_inbox(config: &Config, inbox: &str, show_copied: bool) {
 #[derive(Clone)]
 struct SmtpHandler {
     mail_path: PathBuf,
-    domain: String,
+    domains: Vec<String>,
     current_recipients: Arc<Mutex<Vec<String>>>,
     current_data: Arc<Mutex<Vec<u8>>>,
 }
 
 impl SmtpHandler {
-    fn new(mail_path: PathBuf, domain: String) -> Self {
+    fn new(mail_path: PathBuf, domains: Vec<String>) -> Self {
         Self {
             mail_path,
-            domain,
+            domains,
             current_recipients: Arc::new(Mutex::new(Vec::new())),
             current_data: Arc::new(Mutex::new(Vec::new())),
         }
@@ -288,13 +303,18 @@ impl SmtpHandler {
     }
 
     fn save_email(&self, recipient: &str, data: &[u8]) -> io::Result<()> {
-        let local_part = recipient
-            .split('@')
-            .next()
-            .unwrap_or(recipient)
-            .to_lowercase();
+        let recipient = recipient.to_lowercase();
+        let (local_part, domain) = match recipient.split_once('@') {
+            Some((l, d)) => (l.to_string(), d.to_string()),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("recipient missing domain: {}", recipient),
+                ));
+            }
+        };
 
-        let maildir = self.mail_path.join(&local_part);
+        let maildir = self.mail_path.join(&domain).join(&local_part);
         let tmp_dir = maildir.join("tmp");
         let new_dir = maildir.join("new");
         let cur_dir = maildir.join("cur");
@@ -326,7 +346,11 @@ impl Handler for SmtpHandler {
 
     fn rcpt(&mut self, to: &str) -> Response {
         let to_lower = to.to_lowercase();
-        if to_lower.ends_with(&format!("@{}", self.domain)) {
+        let domain = match to_lower.split_once('@') {
+            Some((_, d)) => d,
+            None => return response::NO_MAILBOX,
+        };
+        if self.domains.iter().any(|d| d == domain) {
             self.current_recipients.lock().unwrap().push(to_lower);
             response::OK
         } else {
@@ -363,8 +387,9 @@ impl Handler for SmtpHandler {
     }
 }
 
-fn run_server(domain: &str, mail_path: &str, bind: &str, port: u16) {
-    let handler = SmtpHandler::new(PathBuf::from(mail_path), domain.to_string());
+fn run_server(domains: Vec<String>, mail_path: &str, bind: &str, port: u16) {
+    let server_name = domains[0].clone();
+    let handler = SmtpHandler::new(PathBuf::from(mail_path), domains);
 
     let addr = format!("{}:{}", bind, port);
 
@@ -372,7 +397,7 @@ fn run_server(domain: &str, mail_path: &str, bind: &str, port: u16) {
     server
         .with_addr(&addr)
         .expect("Invalid address")
-        .with_name(domain);
+        .with_name(&server_name);
 
     server.serve().expect("Failed to start server");
 }
@@ -388,40 +413,46 @@ fn main() {
         Some(Commands::Serve {
             bind,
             port,
-            domain,
+            domains,
             mail_path,
         }) => {
-            let domain = domain.unwrap_or_else(|| {
-                eprintln!("Error: --domain or DOMAIN env var required");
+            if domains.is_empty() {
+                eprintln!("Error: --domains or DOMAINS env var required");
                 std::process::exit(1);
-            });
-            run_server(&domain, &mail_path, &bind, port);
+            }
+            run_server(domains, &mail_path, &bind, port);
         }
         None => {
             let config = load_config();
-            let generated = cli.inbox.is_none();
-            let inbox = cli
-                .inbox
-                .map(|s| parse_inbox_arg(&s, &config))
-                .unwrap_or_else(|| {
-                    let existing_cmd = format!("ls -1 '{}'", config.mail_path);
+            let raw = cli.inbox.unwrap_or_else(|| {
+                eprintln!("Error: missing argument '[local]@<domain>'");
+                std::process::exit(1);
+            });
+            let (local_opt, domain) = parse_inbox_arg(&raw, &config);
+            let (inbox, generated) = match local_opt {
+                Some(l) => (l, false),
+                None => {
+                    let existing_cmd =
+                        format!("ls -1 '{}/{}' 2>/dev/null", config.mail_path, domain);
                     let existing: Vec<String> = run_command(&config, &existing_cmd)
                         .unwrap_or_default()
                         .lines()
                         .map(String::from)
                         .collect();
 
-                    loop {
+                    let chosen = loop {
                         let candidate = generate_inbox_name();
                         if !existing.contains(&candidate) {
-                            let email = format!("{}@{}", candidate, config.domain);
+                            let email = format!("{}@{}", candidate, domain);
                             copy_to_clipboard(&email);
                             break candidate;
                         }
-                    }
-                });
+                    };
+                    (chosen, true)
+                }
+            };
 
-            watch_inbox(&config, &inbox, generated);
+            watch_inbox(&config, &domain, &inbox, generated);
         }
     }
 }
